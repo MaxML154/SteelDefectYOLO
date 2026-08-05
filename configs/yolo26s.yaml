@@ -1,0 +1,48 @@
+model: yolo26s.pt
+epochs: 150
+
+train_params:
+  imgsz: 640
+  batch: 8
+  workers: 4
+  patience: 50
+
+  # YOLO26 uses auto-selection: at current scale (1416 train images, 150 epochs)
+  # optimizer=auto will choose AdamW with lr0=0.001, momentum=0.9
+  optimizer: auto
+  lr0: 0.001
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+
+  # Loss weights (YOLO26 reg_max=1 uses L1, so dfl controls L1 regression gain)
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5  # Controls L1 loss gain in YOLO26
+
+  # Color augmentation (grayscale images - disable hue/saturation)
+  hsv_h: 0.0
+  hsv_s: 0.0
+  hsv_v: 0.4
+
+  # Geometric augmentation (conservative for texture preservation)
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+  mosaic: 1.0
+  mixup: 0.0
+  copy_paste: 0.0
+  auto_augment: null
+  erasing: 0.0
+
+  close_mosaic: 10
+
+  # Removed validation/inference parameters (use framework defaults during training)
+  # conf, iou, max_det are for validation only
+
+  cos_lr: true
+  save_period: 10

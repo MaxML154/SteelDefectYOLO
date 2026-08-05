@@ -1,0 +1,32 @@
+# NEU-DET Dataset Configuration for YOLO
+# Auto-generated template - update paths after running converter_neudet.py and split_neudet.py
+
+# Dataset root (modify this to your actual NEU-DET path)
+path: H:/Study/YoloForSurface/yolo_neudet
+
+# Training and validation image lists (no copying, just paths)
+train: ../datasets/neudet_yolo_train.txt
+val: ../datasets/neudet_yolo_val.txt
+
+# Class definitions
+nc: 6
+names:
+  0: crazing              # network of fine cracks
+  1: inclusion            # non-metallic inclusions
+  2: patches              # irregular patches
+  3: pitted_surface       # pitted corrosion (NEU-DET XML uses 'pitted_surface')
+  4: rolled-in_scale      # rolled-in scale (NEU-DET XML uses 'rolled-in_scale')
+  5: scratches            # linear scratches
+
+# Dataset metadata
+metadata:
+  dataset: NEU-DET
+  source: Northeastern University
+  url: http://faculty.neu.edu.cn/yunhyan/NEU_surface_defect_database.html
+  description: Steel surface defect detection
+  image_size: 200x200
+  format: grayscale
+  samples_per_class: ~300
+  total_samples: 1770
+  split_ratio: 80-20
+  stratified: true
