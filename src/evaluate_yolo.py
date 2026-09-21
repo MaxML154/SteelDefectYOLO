@@ -31,6 +31,9 @@ except ImportError as e:
     print("Install dependencies: pip install -r requirements.txt")
     sys.exit(1)
 
+sys.path.insert(0, str(Path(__file__).parent))
+from model_io import resolve_weight
+
 
 CLASS_NAMES = [
     'crazing', 'inclusion', 'patches',
@@ -162,64 +165,23 @@ def evaluate(args):
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset config not found: {data_path}")
 
-    model_path = Path(args.model)
-
     print("=" * 70)
     print("YOLO Model Evaluation - NEU-DET Industrial Defect Detection")
     print("=" * 70)
-    print(f"Model:   {model_path}")
+    print(f"Model:   {args.model}")
     print(f"Data:    {data_path}")
     print(f"Split:   {args.split}")
     print(f"Device:  {args.device if args.device else 'auto'}")
     print("=" * 70)
 
-    # Load model
-    print(f"\nInitializing model: {model_path}")
-
-    # Check if model exists
-    if not model_path.exists():
-        # Check common locations for trained models
-        common_locations = [
-            Path('outputs') / 'train' / 'weights' / model_path.name,
-            Path('outputs') / 'train_*' / 'weights' / model_path.name,
-            Path('models') / model_path.name,
-            Path.home() / '.cache' / 'ultralytics' / model_path.name,
-        ]
-
-        found = False
-        for loc in common_locations:
-            if '*' in str(loc):
-                # Handle glob pattern
-                matches = list(Path('outputs').glob(f'train*/weights/{model_path.name}'))
-                if matches:
-                    model_path = matches[0]
-                    found = True
-                    print(f"✓ Found model at: {model_path}")
-                    break
-            elif loc.exists():
-                model_path = loc
-                found = True
-                print(f"✓ Found model at: {model_path}")
-                break
-
-        if not found:
-            print(f"⚠ Model not found locally: {model_path}")
-            print(f"Note: If this is a base model name (e.g., yolo11s.pt), Ultralytics will auto-download.")
-            print(f"      For custom trained models, check the path is correct.")
-
-    else:
-        print(f"✓ Using model at: {model_path}")
-
-    # Load model (Ultralytics handles auto-download for base models)
+    print(f"\nInitializing model: {args.model}")
     try:
+        model_path = resolve_weight(args.model, download=False)
+        print(f"Using weights: {model_path}")
         model = YOLO(str(model_path))
-        print("✓ Model loaded successfully")
+        print("Model loaded successfully")
     except Exception as e:
-        print(f"\n✗ Failed to load model: {e}")
-        print(f"\nPlease check:")
-        print(f"  - Model file exists at: {model_path}")
-        print(f"  - Model format is valid (.pt file)")
-        print(f"  - For base models (yolo11s.pt), ensure internet connection for auto-download")
+        print(f"Failed to load model: {e}")
         return False
 
     # Run validation
