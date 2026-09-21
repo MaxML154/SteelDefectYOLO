@@ -1,351 +1,298 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-ONNX model testing and performance benchmarking utility.
+Load an exported ONNX detector, run NMS in post-process, and optionally compare to PyTorch.
 
 Author: MaxML154
 Created: 2026-08-05
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 import time
 from pathlib import Path
-from datetime import datetime
+
 import numpy as np
 
 try:
-    import onnxruntime as ort
     import cv2
+    import onnxruntime as ort
 except ImportError as e:
-    print(f"Error: {e}")
-    print("Please install: pip install onnxruntime opencv-python")
+    print(f"Import error: {e}")
+    print("Install: pip install onnxruntime opencv-python")
     sys.exit(1)
 
+sys.path.insert(0, str(Path(__file__).parent))
+from model_io import resolve_weight
 
-def parse_arguments():
-    """Parse command line arguments."""
+CLASS_NAMES = [
+    "crazing",
+    "inclusion",
+    "patches",
+    "pitted_surface",
+    "rolled-in_scale",
+    "scratches",
+]
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
-        description='Test ONNX exported YOLO models',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Benchmark ONNX inference and decode detections with NMS.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
+    parser.add_argument("--model", required=True, help="ONNX path or models/ filename")
+    parser.add_argument("--image", default=None, help="Test image (random tensor if omitted)")
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold for NMS")
+    parser.add_argument("--iou", type=float, default=0.6, help="IoU threshold for NMS")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--benchmark", type=int, default=100)
     parser.add_argument(
-        '--model',
-        type=str,
-        required=True,
-        help='Path to ONNX model file'
+        "--providers",
+        nargs="+",
+        default=["CPUExecutionProvider"],
+        help="ONNX Runtime providers",
     )
-
     parser.add_argument(
-        '--image',
-        type=str,
+        "--compare-pt",
         default=None,
-        help='Test image path (optional, will use random input if not provided)'
+        help="Optional .pt checkpoint to compare decoded boxes on --image",
     )
-
-    parser.add_argument(
-        '--imgsz',
-        type=int,
-        default=640,
-        help='Input image size'
-    )
-
-    parser.add_argument(
-        '--warmup',
-        type=int,
-        default=10,
-        help='Number of warmup iterations'
-    )
-
-    parser.add_argument(
-        '--benchmark',
-        type=int,
-        default=100,
-        help='Number of iterations for speed benchmark'
-    )
-
-    parser.add_argument(
-        '--providers',
-        type=str,
-        nargs='+',
-        default=['CPUExecutionProvider'],
-        choices=['CPUExecutionProvider', 'CUDAExecutionProvider', 'TensorrtExecutionProvider'],
-        help='ONNX Runtime execution providers'
-    )
-
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Print detailed model information'
-    )
-
+    parser.add_argument("--save", default=None, help="Optional path to save a visualization")
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
-def load_onnx_model(model_path, providers):
-    """Load ONNX model with specified providers."""
-    print(f"\nLoading ONNX model: {model_path}")
+def letterbox(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)):
+    h, w = img.shape[:2]
+    r = min(new_shape / h, new_shape / w)
+    new_unpad = (int(round(w * r)), int(round(h * r)))
+    dw = (new_shape - new_unpad[0]) / 2
+    dh = (new_shape - new_unpad[1]) / 2
+    if (w, h) != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return img, r, (left, top)
 
-    try:
-        session = ort.InferenceSession(str(model_path), providers=providers)
-        print(f"✓ Model loaded successfully")
-        print(f"  Providers: {session.get_providers()}")
-        return session
-    except Exception as e:
-        print(f"✗ Failed to load model: {e}")
-        sys.exit(1)
+
+def preprocess(image_path: str | None, imgsz: int):
+    if not image_path:
+        tensor = np.random.rand(1, 3, imgsz, imgsz).astype(np.float32)
+        return tensor, None, 1.0, (0.0, 0.0), (imgsz, imgsz)
+
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    orig_hw = img.shape[:2]
+    padded, ratio, pad = letterbox(img, imgsz)
+    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+    tensor = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
+    tensor = np.expand_dims(np.ascontiguousarray(tensor), 0)
+    return tensor, img, ratio, pad, orig_hw
 
 
-def print_model_info(session, verbose=False):
-    """Print ONNX model information."""
-    print("\n" + "=" * 70)
-    print("Model Information")
-    print("=" * 70)
+def xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
+    out = np.empty_like(xywh)
+    out[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
+    out[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
+    out[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
+    out[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
+    return out
 
-    # Input info
+
+def nms_detections(raw: np.ndarray, conf_thres: float, iou_thres: float, max_det: int = 300):
+    """Decode Ultralytics detect output (1, 4+nc, n) and apply OpenCV NMS."""
+    if raw.ndim == 3:
+        raw = raw[0]
+    pred = raw.T
+    boxes_xywh = pred[:, :4]
+    scores = pred[:, 4:]
+    cls_ids = scores.argmax(axis=1)
+    conf = scores.max(axis=1)
+    keep = conf >= conf_thres
+    if not np.any(keep):
+        return np.zeros((0, 6), dtype=np.float32)
+
+    boxes_xyxy = xywh_to_xyxy(boxes_xywh[keep])
+    conf = conf[keep]
+    cls_ids = cls_ids[keep]
+    idxs = cv2.dnn.NMSBoxes(
+        bboxes=boxes_xyxy.tolist(),
+        scores=conf.tolist(),
+        score_threshold=conf_thres,
+        nms_threshold=iou_thres,
+    )
+    if len(idxs) == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+    idxs = np.array(idxs).reshape(-1)[:max_det]
+    dets = np.concatenate(
+        [boxes_xyxy[idxs], conf[idxs, None], cls_ids[idxs, None].astype(np.float32)],
+        axis=1,
+    )
+    return dets
+
+
+def scale_boxes(dets: np.ndarray, ratio: float, pad, orig_hw):
+    if dets.size == 0:
+        return dets
+    pad_x, pad_y = pad
+    h, w = orig_hw
+    dets = dets.copy()
+    dets[:, [0, 2]] = (dets[:, [0, 2]] - pad_x) / ratio
+    dets[:, [1, 3]] = (dets[:, [1, 3]] - pad_y) / ratio
+    dets[:, [0, 2]] = dets[:, [0, 2]].clip(0, w)
+    dets[:, [1, 3]] = dets[:, [1, 3]].clip(0, h)
+    return dets
+
+
+def draw_dets(img: np.ndarray, dets: np.ndarray) -> np.ndarray:
+    vis = img.copy()
+    for x1, y1, x2, y2, conf, cls_id in dets:
+        cls_id = int(cls_id)
+        name = CLASS_NAMES[cls_id] if 0 <= cls_id < len(CLASS_NAMES) else str(cls_id)
+        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+        cv2.rectangle(vis, p1, p2, (0, 180, 0), 2)
+        cv2.putText(
+            vis,
+            f"{name} {conf:.2f}",
+            (p1[0], max(0, p1[1] - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 180, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    return vis
+
+
+def print_session_info(session, verbose: bool):
     print("\nInputs:")
     for inp in session.get_inputs():
-        print(f"  Name: {inp.name}")
-        print(f"  Shape: {inp.shape}")
-        print(f"  Type: {inp.type}")
-
-    # Output info
-    print("\nOutputs:")
+        print(f"  {inp.name}: {inp.shape} {inp.type}")
+    print("Outputs:")
     for out in session.get_outputs():
-        print(f"  Name: {out.name}")
-        print(f"  Shape: {out.shape}")
-        print(f"  Type: {out.type}")
-
+        print(f"  {out.name}: {out.shape} {out.type}")
     if verbose:
-        # Metadata
-        metadata = session.get_modelmeta()
-        print("\nMetadata:")
-        print(f"  Producer: {metadata.producer_name}")
-        print(f"  Graph name: {metadata.graph_name}")
-        print(f"  Version: {metadata.version}")
+        meta = session.get_modelmeta()
+        print(f"Producer: {meta.producer_name}")
+        for k, v in (meta.custom_metadata_map or {}).items():
+            print(f"  {k}: {v}")
 
-        if metadata.custom_metadata_map:
-            print("  Custom metadata:")
-            for key, value in metadata.custom_metadata_map.items():
-                print(f"    {key}: {value}")
+
+def compare_with_pytorch(pt_path: Path, image_path: str, conf: float, iou: float, imgsz: int, end2end: bool):
+    from ultralytics import YOLO
+
+    model = YOLO(str(pt_path))
+    kwargs = dict(imgsz=imgsz, conf=conf, iou=iou, verbose=False)
+    if hasattr(model.model, "end2end"):
+        kwargs["end2end"] = end2end
+    result = model.predict(image_path, **kwargs)[0]
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()[:, None]
+    clss = boxes.cls.cpu().numpy()[:, None]
+    return np.concatenate([xyxy, confs, clss], axis=1)
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        model_path = resolve_weight(args.model, download=False)
+    except FileNotFoundError as e:
+        print(e)
+        return 1
+    if model_path.suffix.lower() != ".onnx":
+        print(f"Not an ONNX file: {model_path}")
+        return 1
 
     print("=" * 70)
+    print("ONNX inference test")
+    print("=" * 70)
+    print(f"Model: {model_path}")
 
+    available = ort.get_available_providers()
+    providers = [p for p in args.providers if p in available] or ["CPUExecutionProvider"]
+    session = ort.InferenceSession(str(model_path), providers=providers)
+    print(f"Providers: {session.get_providers()}")
+    print_session_info(session, args.verbose)
 
-def prepare_input(image_path, imgsz):
-    """Prepare input tensor from image or random data."""
-    if image_path:
-        print(f"\nLoading test image: {image_path}")
-        img = cv2.imread(str(image_path))
-        if img is None:
-            print(f"✗ Failed to load image, using random input")
-            return prepare_random_input(imgsz)
-
-        # Resize and preprocess
-        img = cv2.resize(img, (imgsz, imgsz))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.transpose(2, 0, 1)  # HWC to CHW
-        img = np.ascontiguousarray(img)
-        img = img.astype(np.float32) / 255.0
-        img = np.expand_dims(img, axis=0)  # Add batch dimension
-
-        print(f"✓ Image loaded and preprocessed")
-        print(f"  Shape: {img.shape}")
-        return img
-    else:
-        return prepare_random_input(imgsz)
-
-
-def prepare_random_input(imgsz):
-    """Generate random input tensor."""
-    print(f"\nGenerating random input tensor ({imgsz}x{imgsz})...")
-    img = np.random.rand(1, 3, imgsz, imgsz).astype(np.float32)
-    print(f"✓ Random input generated")
-    print(f"  Shape: {img.shape}")
-    return img
-
-
-def warmup_model(session, input_tensor, warmup_runs):
-    """Warmup the model with multiple inference runs."""
-    print(f"\nWarming up model ({warmup_runs} iterations)...")
-
+    tensor, orig_bgr, ratio, pad, orig_hw = preprocess(args.image, args.imgsz)
     input_name = session.get_inputs()[0].name
 
-    for i in range(warmup_runs):
-        _ = session.run(None, {input_name: input_tensor})
-        if (i + 1) % 10 == 0 or (i + 1) == warmup_runs:
-            print(f"  Progress: {i + 1}/{warmup_runs}", end='\r')
+    for _ in range(args.warmup):
+        session.run(None, {input_name: tensor})
 
-    print(f"\n✓ Warmup completed")
-
-
-def benchmark_inference(session, input_tensor, benchmark_runs):
-    """Benchmark inference speed."""
-    print(f"\nBenchmarking inference speed ({benchmark_runs} iterations)...")
-
-    input_name = session.get_inputs()[0].name
     times = []
-
-    for i in range(benchmark_runs):
-        start_time = time.perf_counter()
-        outputs = session.run(None, {input_name: input_tensor})
-        end_time = time.perf_counter()
-
-        times.append((end_time - start_time) * 1000)  # Convert to ms
-
-        if (i + 1) % 10 == 0 or (i + 1) == benchmark_runs:
-            print(f"  Progress: {i + 1}/{benchmark_runs}", end='\r')
-
-    print()  # New line after progress
-
-    # Calculate statistics
+    outputs = None
+    for _ in range(args.benchmark):
+        t0 = time.perf_counter()
+        outputs = session.run(None, {input_name: tensor})
+        times.append((time.perf_counter() - t0) * 1000)
     times = np.array(times)
-    mean_time = np.mean(times)
-    std_time = np.std(times)
-    min_time = np.min(times)
-    max_time = np.max(times)
-    p50_time = np.percentile(times, 50)
-    p95_time = np.percentile(times, 95)
-    p99_time = np.percentile(times, 99)
+    mean = float(times.mean())
 
-    print("\n" + "=" * 70)
-    print("Benchmark Results")
-    print("=" * 70)
-    print(f"Mean inference time:   {mean_time:.2f} ms (± {std_time:.2f} ms)")
-    print(f"Min inference time:    {min_time:.2f} ms")
-    print(f"Max inference time:    {max_time:.2f} ms")
-    print(f"P50 (median):          {p50_time:.2f} ms")
-    print(f"P95:                   {p95_time:.2f} ms")
-    print(f"P99:                   {p99_time:.2f} ms")
-    print(f"Throughput:            {1000 / mean_time:.2f} FPS")
-    print("=" * 70)
+    print("\nBenchmark")
+    print("-" * 70)
+    print(f"Mean: {mean:.2f} ms   P50: {np.percentile(times, 50):.2f} ms   "
+          f"P95: {np.percentile(times, 95):.2f} ms   FPS: {1000 / mean:.2f}")
 
-    return outputs, times
-
-
-def analyze_outputs(outputs):
-    """Analyze model outputs."""
-    print("\n" + "=" * 70)
-    print("Output Analysis")
-    print("=" * 70)
-
-    for i, output in enumerate(outputs):
-        print(f"\nOutput {i}:")
-        print(f"  Shape: {output.shape}")
-        print(f"  Dtype: {output.dtype}")
-        print(f"  Min: {np.min(output):.6f}")
-        print(f"  Max: {np.max(output):.6f}")
-        print(f"  Mean: {np.mean(output):.6f}")
-        print(f"  Std: {np.std(output):.6f}")
-
-        # Check for NaN or Inf
-        has_nan = np.isnan(output).any()
-        has_inf = np.isinf(output).any()
-
-        if has_nan:
-            print(f"  ⚠ WARNING: Contains NaN values!")
-        if has_inf:
-            print(f"  ⚠ WARNING: Contains Inf values!")
-
-        if not has_nan and not has_inf:
-            print(f"  ✓ Output is valid (no NaN/Inf)")
-
-    print("=" * 70)
-
-
-def save_benchmark_results(model_path, providers, times, output_shapes, imgsz):
-    """Save benchmark results to file."""
-    model_path = Path(model_path)
-    result_path = model_path.parent / f"{model_path.stem}_benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-
-    with open(result_path, 'w', encoding='utf-8') as f:
-        f.write("ONNX Model Benchmark Results\n")
-        f.write("=" * 70 + "\n\n")
-        f.write(f"Model: {model_path.name}\n")
-        f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-        f.write(f"Input size: {imgsz}x{imgsz}\n")
-        f.write(f"Providers: {', '.join(providers)}\n")
-        f.write(f"Benchmark runs: {len(times)}\n\n")
-
-        f.write("Inference Time Statistics:\n")
-        f.write("-" * 70 + "\n")
-        f.write(f"Mean:   {np.mean(times):.2f} ms\n")
-        f.write(f"Std:    {np.std(times):.2f} ms\n")
-        f.write(f"Min:    {np.min(times):.2f} ms\n")
-        f.write(f"Max:    {np.max(times):.2f} ms\n")
-        f.write(f"P50:    {np.percentile(times, 50):.2f} ms\n")
-        f.write(f"P95:    {np.percentile(times, 95):.2f} ms\n")
-        f.write(f"P99:    {np.percentile(times, 99):.2f} ms\n")
-        f.write(f"FPS:    {1000 / np.mean(times):.2f}\n\n")
-
-        f.write("Output Shapes:\n")
-        f.write("-" * 70 + "\n")
-        for i, shape in enumerate(output_shapes):
-            f.write(f"Output {i}: {shape}\n")
-
-        f.write("\n" + "=" * 70 + "\n")
-
-    print(f"\n✓ Benchmark results saved to: {result_path}")
-    return result_path
-
-
-def main():
-    """Main execution function."""
-    args = parse_arguments()
-
-    # Validate model path
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"✗ Model file not found: {model_path}")
+    raw = outputs[0]
+    print(f"\nRaw output shape: {raw.shape}  min={raw.min():.4f}  max={raw.max():.4f}")
+    if np.isnan(raw).any() or np.isinf(raw).any():
+        print("WARNING: output contains NaN/Inf")
         return 1
 
-    if model_path.suffix != '.onnx':
-        print(f"✗ Not an ONNX file: {model_path}")
-        return 1
+    dets = nms_detections(raw, args.conf, args.iou)
+    if orig_bgr is not None:
+        dets = scale_boxes(dets, ratio, pad, orig_hw)
 
-    print("=" * 70)
-    print("ONNX Model Testing and Benchmarking")
-    print("=" * 70)
+    print(f"Detections after NMS (conf={args.conf}, iou={args.iou}): {len(dets)}")
+    for x1, y1, x2, y2, conf, cls_id in dets:
+        cls_id = int(cls_id)
+        name = CLASS_NAMES[cls_id] if 0 <= cls_id < len(CLASS_NAMES) else str(cls_id)
+        print(f"  {name:16s}  {conf:.3f}  [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
 
-    # Load model
-    session = load_onnx_model(model_path, args.providers)
+    if args.compare_pt and args.image:
+        try:
+            pt_path = resolve_weight(args.compare_pt, download=False)
+        except FileNotFoundError as e:
+            print(e)
+            return 1
+        end2end = "one_to_one" in model_path.stem
+        pt_dets = compare_with_pytorch(pt_path, args.image, args.conf, args.iou, args.imgsz, end2end)
+        print(f"\nPyTorch detections: {len(pt_dets)}   ONNX detections: {len(dets)}")
+        print("Counts should be close; small coordinate diffs are expected after ORT.")
 
-    # Print model info
-    print_model_info(session, verbose=args.verbose)
+    if args.save and orig_bgr is not None:
+        vis = draw_dets(orig_bgr, dets)
+        save_path = Path(args.save)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(save_path), vis)
+        print(f"Wrote {save_path}")
 
-    # Prepare input
-    input_tensor = prepare_input(args.image, args.imgsz)
-
-    # Warmup
-    warmup_model(session, input_tensor, args.warmup)
-
-    # Benchmark
-    outputs, times = benchmark_inference(session, input_tensor, args.benchmark)
-
-    # Analyze outputs
-    analyze_outputs(outputs)
-
-    # Save results
-    output_shapes = [output.shape for output in outputs]
-    result_path = save_benchmark_results(
-        model_path,
-        session.get_providers(),
-        times,
-        output_shapes,
-        args.imgsz
+    result_path = model_path.parent / f"{model_path.stem}_benchmark.txt"
+    result_path.write_text(
+        "\n".join(
+            [
+                "ONNX benchmark",
+                f"Model: {model_path}",
+                f"Providers: {session.get_providers()}",
+                f"Mean ms: {mean:.2f}",
+                f"FPS: {1000 / mean:.2f}",
+                f"Raw shape: {raw.shape}",
+                f"NMS detections: {len(dets)}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
     )
-
-    print("\n" + "=" * 70)
-    print("Testing completed successfully!")
-    print("=" * 70)
-    print(f"\n✓ Model is working correctly")
-    print(f"✓ Average inference time: {np.mean(times):.2f} ms ({1000/np.mean(times):.2f} FPS)")
-    print(f"✓ Results saved to: {result_path}")
-    print("=" * 70)
-
+    print(f"Wrote {result_path}")
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
