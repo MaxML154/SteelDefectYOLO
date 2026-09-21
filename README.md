@@ -27,7 +27,7 @@ Real-time steel surface defect detection using YOLO architectures, optimized for
 - ✅ **Multi-model support**: YOLOv8, YOLOv11, YOLOv26 (n/s/m/l/x variants)
 - ✅ **YOLO26 dual-head evaluation**: One-to-one (NMS-free) vs One-to-many (traditional)
 - ✅ **Industrial metrics**: FNR, FPR, per-class performance analysis
-- ✅ **ONNX export**: Production-ready deployment with FP16/INT8 quantization
+- ✅ **ONNX export**: FP32 raw-box export; NMS stays in post-process
 - ✅ **Optimized for small datasets**: Specialized augmentation presets
 - ✅ **Auto model download**: Models cached in `models/` directory
 
@@ -267,80 +267,27 @@ train_params:
 
 ## ONNX Export
 
-### Basic Export (CPU/GPU deployment)
+Export writes a raw detection tensor (`1, 10, 8400` for 6 classes at 640). NMS is **not** inside the graph; `test_onnx_model.py` applies it after inference so `conf` / `iou` stay tunable.
+
+Weights are resolved from `models/` or an existing path (trained `best.pt` under `runs/` is fine). Official names such as `yolo26n.pt` download into `models/`.
 
 ```bash
+pip install onnx onnxslim onnxruntime
+
 python src/export_to_onnx.py \
-  --model runs/detect/<run>/weights/best.pt \
+  --model runs/detect/output/yolo26n_cleaned_v3/weights/best.pt \
   --end2end false \
-  --imgsz 640 \
-  --simplify
-```
+  --imgsz 640
 
-### FP16 Export (GPU acceleration)
-
-```bash
-python src/export_to_onnx.py \
-  --model runs/detect/<run>/weights/best.pt \
-  --end2end false \
-  --imgsz 640 \
-  --half \
-  --simplify
-```
-
-**Benefits:**
-- Model size reduced by 50%
-- ~2x faster inference on GPU
-- Accuracy loss <0.5%
-
-### Dynamic Batch Size
-
-```bash
-python src/export_to_onnx.py \
-  --model runs/detect/<run>/weights/best.pt \
-  --end2end false \
-  --imgsz 640 \
-  --dynamic \
-  --simplify
-```
-
-### YOLO26 Detection Heads
-
-YOLO26 models have dual detection heads:
-
-| Head Mode | Flag | Description | When to Use |
-|-----------|------|-------------|-------------|
-| **one-to-many** | `--end2end false` | Traditional + NMS | **Production (best mAP)** |
-| one-to-one | `--end2end true` | NMS-free, end-to-end | Real-time priority |
-
-**Recommendation:** Use `--end2end false` for highest accuracy (84.33% mAP@0.5).
-
-### Testing ONNX Model
-
-```bash
-# Basic test (random input)
 python src/test_onnx_model.py \
-  --model model.onnx \
-  --benchmark 100
-
-# Test with real image
-python src/test_onnx_model.py \
-  --model model.onnx \
-  --image path/to/test.jpg \
-  --benchmark 100
-
-# GPU acceleration
-python src/test_onnx_model.py \
-  --model model.onnx \
-  --providers CUDAExecutionProvider CPUExecutionProvider \
-  --benchmark 1000
+  --model models/best_one_to_many.onnx \
+  --image path/to/val.jpg \
+  --conf 0.25 \
+  --iou 0.6 \
+  --compare-pt runs/detect/output/yolo26n_cleaned_v3/weights/best.pt
 ```
 
-**Output includes:**
-- Model metadata and shapes
-- Inference time statistics (mean, P50, P95, P99)
-- Throughput (FPS)
-- Numerical validation (NaN/Inf checks)
+`--end2end false` selects the YOLO26 one-to-many head (84.33% mAP@0.5 on val). `--half` is optional for NVIDIA GPUs. Do not pass `--dynamic` unless batch or input size must vary at runtime.
 
 ---
 
@@ -357,10 +304,11 @@ SteelDefectYOLO/
 ├── src/                   # Source code
 │   ├── data/
 │   │   └── indus_argumentation.py  # Augmentation presets
+│   ├── model_io.py               # Resolve weights under models/
 │   ├── train_yolo.py             # Training script
 │   ├── evaluate_yolo.py          # Evaluation with industrial metrics
-│   ├── export_to_onnx.py         # ONNX export utility
-│   └── test_onnx_model.py        # ONNX testing and benchmarking
+│   ├── export_to_onnx.py         # ONNX export (raw boxes, no NMS in graph)
+│   └── test_onnx_model.py        # ONNX Runtime + post-process NMS
 ├── tools/                 # Utilities
 │   ├── converter_neudet.py       # XML to YOLO label converter
 │   └── visualize.py              # Visualization tools
