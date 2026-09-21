@@ -21,6 +21,7 @@ except ImportError as e:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from data.indus_argumentation import get_augmentation_config, get_training_hyperparams
+from model_io import resolve_weight
 
 
 def load_model_config(config_path: Path) -> dict:
@@ -79,57 +80,6 @@ def print_training_config(args, train_params):
     print(f"Workers:          {train_params.get('workers', 4)}")
     print("=" * 70)
     print()
-
-
-def resolve_model_path(model_name: str) -> str:
-    """
-    Resolve model path with priority: absolute path > models/ dir > Ultralytics cache.
-
-    Args:
-        model_name: Model filename (e.g., 'yolo11s.pt') or path
-
-    Returns:
-        Resolved model path as string
-    """
-    model_path = Path(model_name)
-
-    # If absolute path or file exists at given path, use directly
-    if model_path.is_absolute():
-        if model_path.exists():
-            print(f"✓ Using model at: {model_path}")
-            return str(model_path)
-        else:
-            print(f"✗ Model not found at: {model_path}")
-            return str(model_name)
-
-    # Check if relative path exists
-    if model_path.exists():
-        print(f"✓ Using existing model: {model_path}")
-        return str(model_path)
-
-    # Check project models/ directory first
-    project_model = Path('models') / model_name
-    if project_model.exists():
-        print(f"✓ Found model in models/ directory")
-        return str(project_model)
-
-    # Check Ultralytics cache locations
-    cache_locations = [
-        Path.home() / '.cache' / 'ultralytics' / model_name,
-        Path.home() / '.config' / 'Ultralytics' / model_name,
-    ]
-
-    for loc in cache_locations:
-        if loc.exists():
-            print(f"✓ Found cached model at: {loc}")
-            return str(loc)
-
-    # Not found - will be downloaded by Ultralytics
-    print(f"Model '{model_name}' not found locally")
-    print(f"Ultralytics will auto-download from: https://github.com/ultralytics/assets/releases")
-    print(f"Downloaded models will be cached by Ultralytics")
-
-    return str(model_name)
 
 
 def train(args):
@@ -215,19 +165,15 @@ def train(args):
             print("Training cancelled.")
             return
 
-    # Resolve model path
     print(f"\nResolving model: {args.model}")
-    model_path = resolve_model_path(args.model)
-
     try:
-        model = YOLO(model_path)
-        print("✓ Model loaded successfully")
+        model_path = resolve_weight(args.model)
+        print(f"Using weights: {model_path}")
+        model = YOLO(str(model_path))
+        print("Model loaded successfully")
     except Exception as e:
-        print(f"\n✗ Failed to load model: {e}")
-        print("\nPossible solutions:")
-        print("  1. Check internet connection (required for auto-download)")
-        print("  2. Manually download from: https://github.com/ultralytics/assets/releases")
-        print(f"  3. Place model in models/ directory: models/{Path(args.model).name}")
+        print(f"Failed to load model: {e}")
+        print("Place official weights in models/ or pass an existing .pt path.")
         return False
 
     print("\nStarting training...")
