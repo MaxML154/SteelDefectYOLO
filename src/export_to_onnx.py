@@ -1,316 +1,149 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-Export YOLO models to ONNX format for deployment.
+Export a trained YOLO checkpoint to ONNX (raw boxes, NMS left to post-process).
 
 Author: MaxML154
 Created: 2026-08-05
 """
 
+from __future__ import annotations
+
 import argparse
+import shutil
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 try:
     from ultralytics import YOLO
-    import torch
 except ImportError as e:
-    print(f"Error: {e}")
-    print("Please install required packages: pip install ultralytics torch")
+    print(f"Import error: {e}")
+    print("Install dependencies: pip install -r requirements.txt")
     sys.exit(1)
 
+sys.path.insert(0, str(Path(__file__).parent))
+from model_io import MODELS_DIR, resolve_weight
 
-def parse_arguments():
-    """Parse command line arguments."""
+
+def parse_args():
     parser = argparse.ArgumentParser(
-        description='Export YOLO models to ONNX format',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Export YOLO weights to ONNX. NMS is not baked into the graph.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    # Model configuration
+    parser.add_argument("--model", required=True, help="Checkpoint path or models/ filename")
     parser.add_argument(
-        '--model',
-        type=str,
-        required=True,
-        help='Path to YOLO model weights (.pt file)'
-    )
-
-    parser.add_argument(
-        '--output',
-        type=str,
+        "--output",
         default=None,
-        help='Output ONNX file path (default: same as model with .onnx extension)'
+        help="ONNX output path (default: models/<stem>_<head>.onnx)",
     )
-
-    # YOLO26 specific
     parser.add_argument(
-        '--end2end',
-        type=str,
-        default='false',
-        choices=['true', 'false', 'auto'],
-        help='YOLO26 detection head: true (one-to-one), false (one-to-many+NMS), auto (framework default)'
+        "--end2end",
+        choices=["true", "false"],
+        default="false",
+        help="YOLO26 head: false=one-to-many (recommended), true=one-to-one",
     )
-
-    # Export parameters
+    parser.add_argument("--imgsz", type=int, default=640, help="Export input size")
+    parser.add_argument("--batch", type=int, default=1, help="Fixed batch size")
+    parser.add_argument("--opset", type=int, default=17, help="ONNX opset")
+    parser.add_argument("--device", default="cpu", help="Export device")
+    parser.add_argument("--half", action="store_true", help="FP16 weights (GPU deployment)")
+    parser.add_argument("--dynamic", action="store_true", help="Dynamic batch/spatial axes")
     parser.add_argument(
-        '--imgsz',
-        type=int,
-        nargs='+',
-        default=[640],
-        help='Input image size (height width) or single size for square images'
+        "--no-simplify",
+        action="store_true",
+        help="Skip ONNX graph simplification",
     )
-
-    parser.add_argument(
-        '--batch',
-        type=int,
-        default=1,
-        help='Batch size for export (use -1 for dynamic batch)'
-    )
-
-    parser.add_argument(
-        '--dynamic',
-        action='store_true',
-        help='Enable dynamic axes for batch size and image dimensions'
-    )
-
-    parser.add_argument(
-        '--simplify',
-        action='store_true',
-        help='Simplify ONNX model using onnxslim/onnx-simplifier'
-    )
-
-    parser.add_argument(
-        '--opset',
-        type=int,
-        default=17,
-        help='ONNX opset version'
-    )
-
-    parser.add_argument(
-        '--half',
-        action='store_true',
-        help='Export in FP16 (half precision) mode'
-    )
-
-    parser.add_argument(
-        '--int8',
-        action='store_true',
-        help='Export with INT8 quantization (requires calibration data)'
-    )
-
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='cpu',
-        help='Device to use for export (cpu, cuda, cuda:0, etc.)'
-    )
-
-    # Metadata
-    parser.add_argument(
-        '--metadata',
-        action='store_true',
-        help='Include training metadata in exported model'
-    )
-
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Print detailed export information'
-    )
-
     return parser.parse_args()
 
 
-def validate_model_path(model_path):
-    """Validate model path exists and is a .pt file."""
-    model_path = Path(model_path)
-
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    if model_path.suffix != '.pt':
-        raise ValueError(f"Model must be a .pt file, got: {model_path.suffix}")
-
-    return model_path
+def default_output(model_path: Path, end2end: bool) -> Path:
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = "_one_to_one" if end2end else "_one_to_many"
+    return MODELS_DIR / f"{model_path.stem}{suffix}.onnx"
 
 
-def determine_output_path(model_path, output_arg, end2end_mode):
-    """Determine the output ONNX file path."""
-    if output_arg:
-        output_path = Path(output_arg)
-    else:
-        # Auto-generate output path
-        model_path = Path(model_path)
-        parent_dir = model_path.parent
-
-        # Add end2end mode suffix for YOLO26
-        if end2end_mode == 'true':
-            suffix = '_one_to_one'
-        elif end2end_mode == 'false':
-            suffix = '_one_to_many'
-        else:
-            suffix = ''
-
-        output_path = parent_dir / f"{model_path.stem}{suffix}.onnx"
-
-    return output_path
-
-
-def export_model(model, args, output_path):
-    """Export YOLO model to ONNX format."""
-
-    print("\n" + "=" * 70)
-    print("YOLO Model Export to ONNX")
-    print("=" * 70)
-    print(f"Model:        {args.model}")
-    print(f"Output:       {output_path}")
-    print(f"Image size:   {args.imgsz}")
-    print(f"Batch size:   {'Dynamic' if args.dynamic or args.batch == -1 else args.batch}")
-    print(f"Device:       {args.device}")
-    print(f"ONNX opset:   {args.opset}")
-    print(f"Simplify:     {args.simplify}")
-    print(f"Half (FP16):  {args.half}")
-    print(f"INT8:         {args.int8}")
-
-    # YOLO26 specific
-    if args.end2end != 'auto':
-        print(f"End2end mode: {args.end2end} ({'one-to-one' if args.end2end == 'true' else 'one-to-many+NMS'})")
-
-    print("=" * 70)
-
-    # Prepare export parameters
-    export_kwargs = {
-        'format': 'onnx',
-        'imgsz': args.imgsz if len(args.imgsz) > 1 else args.imgsz[0],
-        'batch': args.batch,
-        'dynamic': args.dynamic,
-        'simplify': args.simplify,
-        'opset': args.opset,
-        'half': args.half,
-        'int8': args.int8,
-        'device': args.device,
-    }
-
-    # Add end2end parameter for YOLO26
-    if args.end2end == 'true':
-        export_kwargs['end2end'] = True
-    elif args.end2end == 'false':
-        export_kwargs['end2end'] = False
-    # 'auto' means don't set it, let framework decide
-
-    print("\nStarting export...")
-    print("-" * 70)
+def main() -> int:
+    args = parse_args()
+    end2end = args.end2end == "true"
 
     try:
-        # Export model
-        export_path = model.export(**export_kwargs)
-
-        print("-" * 70)
-        print(f"✓ Export successful!")
-        print(f"✓ Saved to: {export_path}")
-
-        # Rename if custom output path specified
-        export_path_obj = Path(export_path)
-        if export_path_obj != output_path:
-            if output_path.exists():
-                print(f"Warning: Overwriting existing file: {output_path}")
-            export_path_obj.rename(output_path)
-            print(f"✓ Renamed to: {output_path}")
-
-        # Get model info
-        model_info = {
-            'export_time': datetime.now().isoformat(),
-            'input_shape': f"batch={args.batch if not args.dynamic else 'dynamic'}, channels=3, height={args.imgsz[0] if len(args.imgsz) > 1 else args.imgsz}, width={args.imgsz[-1]}",
-            'opset_version': args.opset,
-            'precision': 'FP16' if args.half else ('INT8' if args.int8 else 'FP32'),
-            'simplified': args.simplify,
-        }
-
-        if args.end2end != 'auto':
-            model_info['detection_head'] = 'one-to-one (NMS-free)' if args.end2end == 'true' else 'one-to-many (with NMS)'
-
-        print("\n" + "=" * 70)
-        print("Export Summary")
-        print("=" * 70)
-        for key, value in model_info.items():
-            print(f"{key.replace('_', ' ').title():<20}: {value}")
-        print("=" * 70)
-
-        # Save export info
-        info_path = output_path.with_suffix('.export_info.txt')
-        with open(info_path, 'w', encoding='utf-8') as f:
-            f.write("YOLO ONNX Export Information\n")
-            f.write("=" * 70 + "\n\n")
-            for key, value in model_info.items():
-                f.write(f"{key.replace('_', ' ').title():<20}: {value}\n")
-            f.write("\n" + "=" * 70 + "\n")
-            f.write(f"Command: {' '.join(sys.argv)}\n")
-
-        print(f"\n✓ Export information saved to: {info_path}")
-
-        return True
-
-    except Exception as e:
-        print(f"\n✗ Export failed: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        return False
-
-
-def main():
-    """Main execution function."""
-    args = parse_arguments()
-
-    try:
-        # Validate model path
-        model_path = validate_model_path(args.model)
-
-        # Determine output path
-        output_path = determine_output_path(model_path, args.output, args.end2end)
-
-        # Create output directory if needed
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Load model
-        print(f"\nLoading model from: {model_path}")
-        model = YOLO(str(model_path))
-
-        # Check if YOLO26
-        is_yolo26 = hasattr(model.model, 'end2end')
-        if is_yolo26:
-            print("✓ YOLO26 model detected")
-            if args.end2end == 'auto':
-                print("  Warning: Using 'auto' mode for YOLO26. Specify --end2end true/false for explicit head selection.")
-        else:
-            print("✓ Standard YOLO model detected")
-            if args.end2end != 'auto':
-                print(f"  Warning: --end2end {args.end2end} has no effect on non-YOLO26 models")
-
-        # Export model
-        success = export_model(model, args, output_path)
-
-        if success:
-            print("\n" + "=" * 70)
-            print("ONNX export completed successfully!")
-            print("=" * 70)
-            print("\nNext steps:")
-            print("1. Test the exported ONNX model with ONNXRuntime")
-            print("2. Optimize for target deployment platform (TensorRT, OpenVINO, etc.)")
-            print("3. Benchmark inference speed and accuracy")
-            print("=" * 70)
-            return 0
-        else:
-            return 1
-
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
+        model_path = resolve_weight(args.model, download=False)
+    except FileNotFoundError as e:
+        print(e)
         return 1
 
+    output_path = Path(args.output) if args.output else default_output(model_path, end2end)
+    if not output_path.is_absolute():
+        output_path = (Path.cwd() / output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-if __name__ == '__main__':
+    print("=" * 70)
+    print("YOLO ONNX export")
+    print("=" * 70)
+    print(f"Weights:     {model_path}")
+    print(f"Output:      {output_path}")
+    print(f"imgsz:       {args.imgsz}")
+    print(f"batch:       {args.batch}{' (dynamic)' if args.dynamic else ''}")
+    print(f"opset:       {args.opset}")
+    print(f"precision:   {'FP16' if args.half else 'FP32'}")
+    print(f"simplify:    {not args.no_simplify}")
+    print(f"head:        {'one-to-one' if end2end else 'one-to-many'}")
+    print("NMS:         post-process (not in graph)")
+    print("=" * 70)
+
+    model = YOLO(str(model_path))
+    is_yolo26 = hasattr(model.model, "end2end")
+    if is_yolo26:
+        print(f"YOLO26 detected; exporting end2end={end2end}")
+    elif end2end:
+        print("Warning: --end2end true is ignored on non-YOLO26 models")
+
+    export_kwargs = {
+        "format": "onnx",
+        "imgsz": args.imgsz,
+        "batch": args.batch,
+        "dynamic": args.dynamic,
+        "simplify": not args.no_simplify,
+        "opset": args.opset,
+        "half": args.half,
+        "device": args.device,
+        "nms": False,
+    }
+    if is_yolo26:
+        export_kwargs["end2end"] = end2end
+
+    try:
+        exported = Path(model.export(**export_kwargs))
+    except Exception as e:
+        print(f"Export failed: {e}")
+        return 1
+
+    if exported.resolve() != output_path.resolve():
+        if output_path.exists():
+            output_path.unlink()
+        shutil.move(str(exported), str(output_path))
+
+    info_path = output_path.with_suffix(".export_info.txt")
+    lines = [
+        "YOLO ONNX Export Information",
+        "=" * 70,
+        f"Export time     : {datetime.now().isoformat()}",
+        f"Source weights  : {model_path}",
+        f"ONNX            : {output_path}",
+        f"Input           : batch={args.batch}, 3x{args.imgsz}x{args.imgsz}",
+        f"Opset           : {args.opset}",
+        f"Precision       : {'FP16' if args.half else 'FP32'}",
+        f"Simplified      : {not args.no_simplify}",
+        f"Detection head  : {'one-to-one' if end2end else 'one-to-many'}",
+        "NMS             : not in graph (apply after inference)",
+        "=" * 70,
+        f"Command: {' '.join(sys.argv)}",
+    ]
+    info_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(f"Saved ONNX: {output_path}")
+    print(f"Saved info: {info_path}")
+    return 0
+
+
+if __name__ == "__main__":
     sys.exit(main())
